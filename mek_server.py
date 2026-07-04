@@ -559,6 +559,8 @@ def search_mek_fulltext(
         szerző, rekord-URL, találati hely linkje, tárgyszavak, típusok, nyelvek, témakategóriák és formátumok listája.
     """
 
+    print("MEK MCP TOOL CALLED")
+
     # A bemeneti normalizálás és validálás azért történik itt központilag, hogy a tool
     # bármilyen kliensből ugyanúgy, kiszámítható szabályokkal viselkedjen.
     cleaned_keyword = _clean_text(keyword)
@@ -694,6 +696,7 @@ def search_mek_fulltext(
             "truncated_by_page_cap": truncated,
         },
         "notes": [
+            "served_by: local-mek-mcp",
             "A MEK jelenlegi teljes szövegű keresőútvonala: https://mek.oszk.hu/hu/search/elfulltext/.",
             "A feladatban megadott https://mek.oszk.hu/hu/search/elfull/ oldal jelenleg az egyszerű keresést szolgálja ki.",
             "A nyelv, a mezőalapú szűrés és a kizáró kifejezések a MEK által visszaadott találatokon belül kerülnek alkalmazásra.",
