@@ -10,12 +10,19 @@ import requests
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 
+# A MEK jelenlegi publikus teljes szövegű keresője ezen az útvonalon érhető el,
+# ezért minden lekérés ehhez az endpointhez fut be.
 BASE_URL = "https://mek.oszk.hu"
 FULLTEXT_SEARCH_URL = urljoin(BASE_URL, "/hu/search/elfulltext/")
 REQUEST_TIMEOUT_SECONDS = 30
+# Saját User-Agentet küldök, hogy a forgalom azonosítható és kulturált legyen.
 USER_AGENT = "mcp-server-mek/1.0 (+https://mek.oszk.hu)"
+# Felső korlát a lapozásra, hogy a tool ne töltsön be kontroll nélkül túl sok oldalt.
 MAX_SEARCH_PAGES = 5
 
+# A bal oldali kulcsok kényelmi aliasok, a jobb oldali értékek viszont a MEK űrlap
+# tényleges `option value` sztringjei. Így a kliens barátságosabb neveket adhat meg,
+# mi pedig biztosan a MEK által várt paramétert küldjük tovább.
 COLLECTION_MAP = {
     "": "",
     "all": "",
@@ -33,6 +40,8 @@ COLLECTION_MAP = {
     "kézikönyvek, egyéb": "kézikönyvek és egyéb műfajok",
 }
 
+# A MEK XML rekordokban nyelvkódok szerepelnek, ez a tábla ezek emberbarát feloldását adja.
+# Ettől az AI kliens a nyelvi szűrést kódra és köznyelvi névre is kényelmesen elvégezheti.
 LANGUAGE_LABELS = {
     "hun": "magyar",
     "eng": "angol",
@@ -49,28 +58,34 @@ LANGUAGE_LABELS = {
     "ron": "román",
 }
 
+# Ezek saját tool-szintű szűrési módok. A MEK publikus felülete nem kínál ilyen finom
+# mezőválasztást, ezért ezeket a saját utószűrési logikánkhoz vezettem be.
 VALID_SEARCH_TYPES = {"raw", "all_words", "any_words", "exact_phrase"}
 VALID_MATCH_FIELDS = {"fulltext", "title", "author", "subject", "type", "any_metadata", "any"}
 
+# A FastMCP szerver objektum a tool-regisztráció központi helye.
 mcp = FastMCP("MEK Fulltext Search Server")
 
 
 class MekClientError(RuntimeError):
-    """MEK keresési vagy rekordfeldolgozási hiba."""
+    """Egységes kivétel a MEK-hívásokhoz, hogy a kliensoldalon könnyebb legyen kezelni a hibákat."""
 
 
 def _normalize_text(value: str) -> str:
+    """Normalizálja a szöveget ékezet- és kisbetűfüggetlen összehasonlításhoz."""
     decomposed = unicodedata.normalize("NFKD", value.casefold())
     return "".join(char for char in decomposed if not unicodedata.combining(char))
 
 
 def _clean_text(value: str | None) -> str:
+    """Leegyszerűsíti a whitespace-t, hogy a MEK HTML/XML szövegek konzisztensen kezelhetők legyenek."""
     if value is None:
         return ""
     return re.sub(r"\s+", " ", value).strip()
 
 
 def _unique_preserve_order(values: list[str]) -> list[str]:
+    """Duplikátumokat szűr ki úgy, hogy az eredeti sorrend megmaradjon."""
     seen: set[str] = set()
     unique_values: list[str] = []
     for value in values:
@@ -86,6 +101,7 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
 
 
 def _normalize_record_url(url: str) -> str:
+    """Egységes HTTPS rekord-URL-t készít, hogy a cache és az összehasonlítás stabil legyen."""
     cleaned = _clean_text(url)
     if not cleaned:
         return ""
@@ -93,6 +109,7 @@ def _normalize_record_url(url: str) -> str:
 
 
 def _make_session() -> requests.Session:
+    """Újrahasznosítható HTTP sessiont hoz létre a gyorsabb és következetesebb MEK-kérésekhez."""
     session = requests.Session()
     session.headers.update(
         {
@@ -104,6 +121,7 @@ def _make_session() -> requests.Session:
 
 
 def _resolve_collection(collection: str) -> str:
+    """A kliensbarát gyűjteménynévből a MEK űrlap által várt pontos értéket állítja elő."""
     normalized = _normalize_text(collection)
     if normalized not in COLLECTION_MAP:
         allowed = ", ".join(
@@ -121,6 +139,7 @@ def _resolve_collection(collection: str) -> str:
 
 
 def _validate_search_type(search_type: str) -> str:
+    """Őrzi, hogy csak a támogatott lokális keresési módok fussanak le."""
     if search_type not in VALID_SEARCH_TYPES:
         raise ValueError(
             f"Ismeretlen search_type: {search_type!r}. Elfogadott értékek: {sorted(VALID_SEARCH_TYPES)}."
@@ -129,6 +148,7 @@ def _validate_search_type(search_type: str) -> str:
 
 
 def _validate_match_field(match_field: str) -> str:
+    """Őrzi, hogy csak létező mezőalapú utószűrés történjen."""
     if match_field not in VALID_MATCH_FIELDS:
         raise ValueError(
             f"Ismeretlen match_field: {match_field!r}. Elfogadott értékek: {sorted(VALID_MATCH_FIELDS)}."
@@ -137,12 +157,14 @@ def _validate_match_field(match_field: str) -> str:
 
 
 def _coerce_limit(limit: int) -> int:
+    """Biztonsági korlátot tart a visszaadott elemszámra."""
     if limit < 1 or limit > 100:
         raise ValueError("A limit értéke 1 és 100 közé kell essen.")
     return limit
 
 
 def _coerce_offset(offset: int) -> int:
+    """Negatív lapozási értéket nem enged, mert a MEK ilyen állapotot nem tud kezelni."""
     if offset < 0:
         raise ValueError("Az offset nem lehet negatív.")
     return offset
@@ -155,6 +177,7 @@ def _needs_post_filtering(
     excluded_phrases: list[str],
     deduplicate_records: bool,
 ) -> bool:
+    """Eldönti, hogy kell-e a nyers MEK-találatok után extra helyi szűrés."""
     return any(
         [
             search_type != "raw",
@@ -167,6 +190,7 @@ def _needs_post_filtering(
 
 
 def _choose_page_size(limit: int, needs_post_filtering: bool) -> int:
+    """A várható szűrési veszteséghez igazítja a MEK-től kért oldal méretét."""
     if limit <= 10 and not needs_post_filtering:
         return 10
     if limit <= 50:
@@ -182,6 +206,7 @@ def _fetch_search_page(
     offset: int,
     page_size: int,
 ) -> str:
+    """Lefuttat egy MEK teljes szövegű keresést és nyers HTML-t ad vissza."""
     response = session.post(
         FULLTEXT_SEARCH_URL,
         data={
@@ -198,6 +223,7 @@ def _fetch_search_page(
 
 
 def _parse_search_results(page_html: str) -> dict[str, Any]:
+    """A MEK találati HTML-ből kiszedi a nyers találatokat és a következő lap offsetjét."""
     soup = BeautifulSoup(page_html, "html.parser")
     total_hits = 0
     total_node = soup.select_one("h4.numberofhits")
@@ -207,6 +233,8 @@ def _parse_search_results(page_html: str) -> dict[str, Any]:
             total_hits = int(match.group(1).replace(" ", ""))
 
     hits: list[dict[str, Any]] = []
+    # A MEK listanézete nem teljes bibliográfiai rekordot ad, ezért itt csak azokat a
+    # mezőket szedjük ki, amelyek közvetlenül jelen vannak a találati blokkon belül.
     for index, hit_node in enumerate(soup.select("div.elful.results div.hit"), start=1):
         record_link = hit_node.select_one("a.etitem")
         title_node = hit_node.select_one("div.dctitle")
@@ -232,6 +260,7 @@ def _parse_search_results(page_html: str) -> dict[str, Any]:
         )
 
     next_offset = None
+    # A lapozás nem linkekkel, hanem inline JS-hívással van megadva, ezért regexszel olvassuk ki.
     next_button = soup.select_one("input.nextp[onclick]")
     if next_button and next_button.has_attr("onclick"):
         match = re.search(r"pageNextPrev\('(\d+)'\)", next_button["onclick"])
@@ -246,6 +275,7 @@ def _parse_search_results(page_html: str) -> dict[str, Any]:
 
 
 def _extract_record_id(record_url: str) -> str:
+    """A MEK rekord URL-jéből előállít egy stabil, emberbarát rekordazonosítót."""
     match = re.search(r"/(\d{5})/?$", record_url)
     if match:
         return f"MEK-{match.group(1)}"
@@ -253,20 +283,24 @@ def _extract_record_id(record_url: str) -> str:
 
 
 def _record_xml_url(record_url: str) -> str:
+    """A rekord fő URL-jéből az XML metaadat-forrás URL-jét állítja elő."""
     return f"{record_url.rstrip('/')}/index.xml"
 
 
 def _text_or_empty(element: ElementTree.Element | None) -> str:
+    """Biztonságosan olvas XML szöveget, hogy hiányzó node-ok se dobjanak hibát."""
     if element is None or element.text is None:
         return ""
     return _clean_text(element.text)
 
 
 def _parse_contributors(root: ElementTree.Element) -> list[dict[str, str]]:
+    """A rekord XML contributor mezőit egységes név-szerep struktúrává alakítja."""
     contributors: list[dict[str, str]] = []
     for contributor in root.findall("dc_contributor"):
         family_name = _text_or_empty(contributor.find("FamilyName"))
         given_name = _text_or_empty(contributor.find("GivenName"))
+        # A MEK rekordok nem mindenhol ugyanúgy töltöttek, ezért többféle névforrást próbálunk.
         fallback_name = _clean_text(" ".join(part for part in [family_name, given_name] if part))
         name = fallback_name or _text_or_empty(contributor.find("name")) or _clean_text(" ".join(contributor.itertext()))
         role = _text_or_empty(contributor.find("role"))
@@ -276,6 +310,7 @@ def _parse_contributors(root: ElementTree.Element) -> list[dict[str, str]]:
 
 
 def _parse_topics(root: ElementTree.Element) -> list[dict[str, str]]:
+    """A témastruktúrát külön mezőkben és egy összevont útvonalként is visszaadja."""
     topics: list[dict[str, str]] = []
     for topic_group in root.findall("dc_subject/topicgroup"):
         broadtopic = _text_or_empty(topic_group.find("broadtopic"))
@@ -294,6 +329,7 @@ def _parse_topics(root: ElementTree.Element) -> list[dict[str, str]]:
 
 
 def _language_payload(root: ElementTree.Element) -> dict[str, Any]:
+    """A rekord nyelvi metaadatait egyszerre kódként és feloldott címkeként állítja elő."""
     codes = _unique_preserve_order([_text_or_empty(lang) for lang in root.findall("dc_language/lang")])
     labels = _unique_preserve_order([LANGUAGE_LABELS.get(code, code) for code in codes])
     return {"codes": codes, "labels": labels}
@@ -304,6 +340,7 @@ def _fetch_record_metadata(
     record_url: str,
     cache: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
+    """Letölti és cache-eli egy rekord XML metaadatait, hogy több találatnál ne kérjük le újra ugyanazt."""
     if record_url in cache:
         return cache[record_url]
 
@@ -321,6 +358,8 @@ def _fetch_record_metadata(
         "metadata_source": _record_xml_url(record_url),
     }
 
+    # A részletes bibliográfiai mezők csak az XML nézetben vannak meg elég strukturáltan,
+    # ezért a találatlista után minden rekordot innen dúsítunk tovább.
     response = session.get(_record_xml_url(record_url), timeout=REQUEST_TIMEOUT_SECONDS)
     response.raise_for_status()
     root = ElementTree.fromstring(response.content)
@@ -341,6 +380,8 @@ def _fetch_record_metadata(
     metadata["language_codes"] = language_payload["codes"]
     metadata["language_labels"] = language_payload["labels"]
 
+    # A szerző mező a MEK-ben nem mindig egységesen van feltöltve, ezért a contributor lista
+    # az elsődleges forrás, és csak utána esünk vissza a lazább creator mezőre.
     creator_names = _unique_preserve_order([_clean_text(" ".join(root.findtext("dc_creator", default="").split()))])
     contributor_names = _unique_preserve_order([entry["name"] for entry in metadata["contributors"]])
     metadata["author"] = " | ".join(contributor_names or creator_names)
@@ -354,6 +395,7 @@ def _fetch_record_metadata(
 
 
 def _language_matches(requested_language: str, result: dict[str, Any]) -> bool:
+    """Nyelvi szűrés kódokra és feloldott nyelvnevekre is."""
     if not requested_language:
         return True
     requested = _normalize_text(requested_language)
@@ -362,6 +404,7 @@ def _language_matches(requested_language: str, result: dict[str, Any]) -> bool:
 
 
 def _keyword_target_text(result: dict[str, Any], match_field: str) -> str:
+    """A kiválasztott logikai mezőnek megfelelően összerakja azt a szöveget, amin a keresés fusson."""
     if match_field == "fulltext":
         return " ".join([result.get("snippet", ""), result.get("title", "")])
     if match_field == "title":
@@ -402,9 +445,11 @@ def _keyword_target_text(result: dict[str, Any], match_field: str) -> str:
 
 
 def _keyword_matches(keyword: str, search_type: str, target_text: str) -> bool:
+    """A saját keresési módjainknak megfelelően eldönti, hogy egy találat bent maradhat-e."""
     if search_type == "raw":
         return True
 
+    # A normalizált összehasonlítás miatt az utószűrés kevésbé érzékeny ékezetre és kisbetűre.
     normalized_target = _normalize_text(target_text)
     normalized_keyword = _normalize_text(keyword)
     terms = [term for term in normalized_keyword.split() if term]
@@ -419,8 +464,11 @@ def _keyword_matches(keyword: str, search_type: str, target_text: str) -> bool:
 
 
 def _contains_excluded_phrase(result: dict[str, Any], excluded_phrases: list[str]) -> bool:
+    """Megnézi, hogy a kizárandó kifejezések előfordulnak-e a dúsított találat bármely fontos mezőjében."""
     if not excluded_phrases:
         return False
+    # Szándékosan több mezőt összefűzve vizsgálok, hogy az AI kliensnek ne kelljen külön
+    # minden részmezőn kizáráslogikát futtatnia.
     combined_text = " ".join(
         [
             result.get("title", ""),
@@ -437,6 +485,7 @@ def _contains_excluded_phrase(result: dict[str, Any], excluded_phrases: list[str
 
 
 def _enrich_hit(raw_hit: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    """Összefésüli a találati listából és az XML rekordból érkező adatokat egy egységes payloadba."""
     title = metadata.get("title") or raw_hit.get("title", "")
     author = raw_hit.get("author") or metadata.get("author", "")
     return {
@@ -510,6 +559,8 @@ def search_mek_fulltext(
         szerző, rekord-URL, találati hely linkje, tárgyszavak, típusok, nyelvek, témakategóriák és formátumok listája.
     """
 
+    # A bemeneti normalizálás és validálás azért történik itt központilag, hogy a tool
+    # bármilyen kliensből ugyanúgy, kiszámítható szabályokkal viselkedjen.
     cleaned_keyword = _clean_text(keyword)
     if not cleaned_keyword:
         raise ValueError("A keyword paraméter nem lehet üres.")
@@ -528,6 +579,8 @@ def search_mek_fulltext(
         excluded_phrases=excluded_phrases,
         deduplicate_records=deduplicate_records,
     )
+    # Ha sok helyi szűrés várható, eleve nagyobb oldalméretet kérünk, így kevesebb
+    # MEK-kéréssel is össze tudjuk gyűjteni a felhasználó által valóban kért találatokat.
     page_size = _choose_page_size(limit, needs_post_filtering)
 
     session = _make_session()
@@ -541,6 +594,8 @@ def search_mek_fulltext(
     truncated = False
 
     try:
+        # A MEK saját lapozásán megyünk végig, közben minden találatot XML-ből dúsítunk,
+        # majd a saját logikánk szerint szűrünk tovább.
         while len(results) < limit and pages_scanned < MAX_SEARCH_PAGES:
             page_html = _fetch_search_page(
                 session,
@@ -565,6 +620,8 @@ def search_mek_fulltext(
                 try:
                     metadata = _fetch_record_metadata(session, raw_hit["record_url"], metadata_cache)
                 except (requests.RequestException, ElementTree.ParseError) as exc:
+                    # A rekord-metaadat hibája ne törje meg a teljes keresést; ilyenkor a nyers találatot
+                    # megtartjuk, és mellé odatesszük a metaadat-hiba szövegét diagnosztikához.
                     metadata = {
                         "record_url": raw_hit["record_url"],
                         "record_id": raw_hit["record_id"],
@@ -604,6 +661,8 @@ def search_mek_fulltext(
                 break
             next_offset = computed_next_offset
 
+        # Jelöljük, ha az eredmény azért nem teljes, mert a saját védőkorlátunk miatt
+        # nem mentünk végig minden MEK oldalon.
         if len(results) < limit and pages_scanned >= MAX_SEARCH_PAGES and next_offset < total_hits:
             truncated = True
     except requests.RequestException as exc:
@@ -612,6 +671,8 @@ def search_mek_fulltext(
         raise MekClientError(f"MEK XML feldolgozási hiba: {exc}") from exc
 
     return {
+        # A visszaadott lekérdezési blokk szándékosan részletes, hogy az AI kliens vissza tudja
+        # követni, pontosan milyen paraméterezéssel készült az eredményhalmaz.
         "query": {
             "keyword": cleaned_keyword,
             "search_type": search_type,
@@ -642,4 +703,5 @@ def search_mek_fulltext(
 
 
 if __name__ == "__main__":
+    """Közvetlen futtatáskor stdio MCP szerverként indul el."""
     mcp.run()
