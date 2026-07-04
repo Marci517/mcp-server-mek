@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mek-fulltext-search": {
+      "command": "python3",
+      "args": [
+        "/Users/marcibencze/Desktop/githubrepos/mcp-server-mek/mek_server.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
