@@ -559,7 +559,6 @@ def search_mek_fulltext(
         szerző, rekord-URL, találati hely linkje, tárgyszavak, típusok, nyelvek, témakategóriák és formátumok listája.
     """
 
-    print("MEK MCP TOOL CALLED")
 
     # A bemeneti normalizálás és validálás azért történik itt központilag, hogy a tool
     # bármilyen kliensből ugyanúgy, kiszámítható szabályokkal viselkedjen.
